@@ -1,0 +1,171 @@
+name: Patch Mikrotik RouterOS 6.x
+
+on:
+  # push:
+  #   branches: [ "main" ]
+  # schedule:
+  #   - cron: "0 0 * * *"
+
+  workflow_dispatch:
+    inputs:
+      latest:
+        description: 'Patch Latest Version'
+        type: boolean
+        default: true
+      
+      custom:
+        description: 'Patch Custom Version'
+        type: string
+        default: ''
+        required: false
+
+
+permissions:
+  contents: write
+
+env:
+  CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+  CUSTOM_LICENSE_PUBLIC_KEY: ${{ secrets.CUSTOM_LICENSE_PUBLIC_KEY }}
+  CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+  CUSTOM_NPK_SIGN_PUBLIC_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PUBLIC_KEY }}
+  CUSTOM_CLOUD_PUBLIC_KEY: ${{ secrets.CUSTOM_CLOUD_PUBLIC_KEY }}
+  MIKRO_LICENSE_PUBLIC_KEY: ${{ secrets.MIKRO_LICENSE_PUBLIC_KEY }}
+  MIKRO_NPK_SIGN_PUBLIC_LKEY: ${{ secrets.MIKRO_NPK_SIGN_PUBLIC_LKEY }}
+  MIKRO_CLOUD_PUBLIC_KEY: ${{ secrets.MIKRO_CLOUD_PUBLIC_KEY }}
+  MIKRO_LICENCE_URL: ${{ secrets.MIKRO_LICENCE_URL }}
+  CUSTOM_LICENCE_URL: ${{ secrets.CUSTOM_LICENCE_URL }}
+  MIKRO_UPGRADE_URL: ${{ secrets.MIKRO_UPGRADE_URL }}
+  CUSTOM_UPGRADE_URL: ${{ secrets.CUSTOM_UPGRADE_URL }}
+  MIKRO_RENEW_URL: ${{ secrets.MIKRO_RENEW_URL }}
+  CUSTOM_RENEW_URL: ${{ secrets.CUSTOM_RENEW_URL }}
+  MIKRO_CLOUD_URL: ${{ secrets.MIKRO_CLOUD_URL }}
+  CUSTOM_CLOUD_URL: ${{ secrets.CUSTOM_CLOUD_URL }}
+  API_ENDPOINT: ${{ secrets.API_ENDPOINT }}
+  API_KEY: ${{ secrets.API_KEY }}
+
+jobs:
+  Set_BuildTime:
+    runs-on: ubuntu-22.04
+    outputs:
+      BUILD_TIME: ${{ steps.set_buildtime.outputs.BUILD_TIME }}
+    steps:
+      - name: Set build time
+        id: set_buildtime
+        run: echo "BUILD_TIME=$(date +'%s')" >> $GITHUB_OUTPUT
+
+  Prepare:
+    runs-on: ubuntu-22.04
+    needs: Set_BuildTime
+    outputs:
+        LATEST_VERSION: ${{ steps.get_latest.outputs.LATEST_VERSION }}
+        IS_LATEST: ${{ steps.get_latest.outputs.IS_LATEST }}
+    strategy:
+      matrix:
+        channel: [long-term,stable]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Get latest routeros version
+        id: get_latest
+        run: |
+          if [ "${{ inputs.latest }}" = "true" ]; then
+            LATEST_VERSION=$(wget -nv -O - https://upgrade.mikrotik.com/routeros/NEWEST6.${{ matrix.channel }} | cut -d ' ' -f1)
+            _LATEST_VERSION=$(wget -nv -O - https://${{ env.CUSTOM_UPGRADE_URL }}/routeros/NEWEST6.${{ matrix.channel }}  | cut -d ' ' -f1) || true
+          else
+            LATEST_VERSION=${{ inputs.custom }}
+          fi
+          if [ -z "$LATEST_VERSION" ]; then
+            exit 1
+          fi
+          if [ "$_LATEST_VERSION" == "$LATEST_VERSION" ] && [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "No new version found"
+            echo "IS_LATEST=false" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "IS_LATEST=true" >> $GITHUB_OUTPUT
+          fi
+          echo "LATEST_VERSION=${LATEST_VERSION}" >> $GITHUB_OUTPUT
+          echo "LATEST_VERSION=${LATEST_VERSION}" >> $GITHUB_ENV
+          echo "BUILD_TIME=${{ needs.Set_BuildTime.outputs.BUILD_TIME }}" >> $GITHUB_ENV
+          echo $LATEST_VERSION $BUILD_TIME > ./buildinfo-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+
+      - name: Cache ChangeLog-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+        id: cache-changelog
+        uses: actions/cache@v4
+        with:
+            path: |
+                ./changelog-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+            key: changelog-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+
+      - name: Get ChangeLog
+        if: steps.cache-changelog.outputs.cache-hit != 'true'
+        run: |
+            wget -nv -O changelog-${{ env.LATEST_VERSION }}-${{ matrix.channel }} https://${{ env.MIKRO_UPGRADE_URL }}/routeros/$LATEST_VERSION/CHANGELOG
+            cat changelog-${{ env.LATEST_VERSION }}-${{ matrix.channel }} 
+    
+      - name: cache translation
+        id: cache-translation
+        uses: actions/cache@v4
+        with:
+            path: |
+                ./translation-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+            key: translation-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+
+      - name: Translate ChangeLog
+        if: steps.cache-translation.outputs.cache-hit != 'true'
+        run: |
+            pip install requests
+            python3 translate.py changelog-${{ env.LATEST_VERSION }}-${{ matrix.channel }}  translation-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+        
+      - name: Upload translation
+        uses: actions/upload-artifact@v3
+        with:
+          name: version_info-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+          path: |
+            ./translation-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+            ./buildinfo-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
+    
+          
+
+  RunPatch:
+    needs: Prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [arm,x86,mmips,arm64,smips,mipsbe]
+        channel: [long-term,stable]
+    env:
+      TZ: 'Asia/Shanghai'
+      LATEST_VERSION: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' 
+
+      - name: prepare envs
+        run: |
+          echo "LATEST_VERSION=${{ needs.Prepare.outputs.LATEST_VERSION }}" >> $GITHUB_ENV
+          echo "IS_LATEST=${{ needs.Prepare.outputs.IS_LATEST }}" >> $GITHUB_ENV
+          if [ "${{ matrix.arch }}" == "x86" ]; then
+            ARCH=''
+            echo "ARCH=$ARCH" >> $GITHUB_ENV
+          else
+            ARCH="-${{ matrix.arch }}"
+            echo "ARCH=$ARCH" >> $GITHUB_ENV
+          fi
+
+      - name: Download translation
+        uses: actions/download-artifact@v3
+        with:
+            name: version_info-${{ env.LATEST_VERSION }}-${{ matrix.channel }}
